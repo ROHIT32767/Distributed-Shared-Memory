@@ -1,0 +1,6 @@
+WRITE manuj 100
+WRITE pranav 200
+WRITE rohit 300
+WRITE manuj 10000
+READ manuj 10000
+READ manuj 10000

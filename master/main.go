@@ -5,7 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
-	"strconv"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +20,6 @@ var Magenta = "\033[35m"
 var Cyan = "\033[36m" 
 var Gray = "\033[37m" 
 var White = "\033[97m"
-
 
 type Slave struct {
 	conn net.Conn
@@ -40,17 +39,42 @@ type KeyValueStore struct {
 	keyToSlaves  map[string][]*Slave
 	slaveMutex   sync.Mutex
 	keySlavesMux sync.Mutex
+	logFile      *os.File
 }
 
 func NewKeyValueStore() *KeyValueStore {
+	// Open log file for writing
+	logFile, err := os.OpenFile("kv_store.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf(Red+"Error opening log file: %v\n"+Reset, err)
+	}
+	
 	return &KeyValueStore{
 		slaves:      make([]*Slave, 0),
 		keyToSlaves: make(map[string][]*Slave),
+		logFile:     logFile,
 	}
 }
 
-func (kvs *KeyValueStore) sendRequestToSlave(slave *Slave, requestData string, timeout time.Duration) (string, error) {
-	slave.conn.SetReadDeadline(time.Now().Add(timeout))
+func (kvs *KeyValueStore) closeResources() {
+	if kvs.logFile != nil {
+		kvs.logFile.Close()
+	}
+}
+
+func (kvs *KeyValueStore) logOperation(operation, key, value string) {
+	if kvs.logFile != nil {
+		logEntry := fmt.Sprintf("%s %s %s\n", operation, key, value)
+		_, err := kvs.logFile.WriteString(logEntry)
+		if err != nil {
+			fmt.Printf(Red+"Error writing to log file: %v\n"+Reset, err)
+		}
+		kvs.logFile.Sync() // Ensure data is written to disk
+	}
+}
+
+func (kvs *KeyValueStore) sendRequestToSlave(slave *Slave, requestData string, DB time.Duration) (string, error) {
+	slave.conn.SetReadDeadline(time.Now().Add(DB))
 
 	_, err := slave.conn.Write([]byte(requestData))
 	if err != nil {
@@ -64,7 +88,7 @@ func (kvs *KeyValueStore) sendRequestToSlave(slave *Slave, requestData string, t
 	}
 
 	response := string(buffer[:n])
-	fmt.Printf(Green + "Received valid response from a slave: %s\n", response + Reset)
+	fmt.Printf(Green+"Received valid response from a slave: %s\n", response+Reset)
 	return response, nil
 }
 
@@ -112,16 +136,19 @@ func (kvs *KeyValueStore) receiveAckFromSlaves(requestData string, timeout time.
 
 func (kvs *KeyValueStore) handleWrite(command []string) bool {
 	key := command[1]
+	value := command[2]
 	slaveCount := int(math.Ceil(float64(len(kvs.slaves)+1) * 0.5))
-	selectedSlaves := make([]*Slave, slaveCount)
+	selectedSlaves := make([]*Slave, 0, slaveCount)
 	var indices map[int]bool = make(map[int]bool)
 
-	for i := 0; i < slaveCount; i++ {
-		index := rand.Intn(len(kvs.slaves))
-		_, ok := indices[index]
-		if !ok {
-			indices[index] = true
-			selectedSlaves[i] = kvs.slaves[index]
+	if len(kvs.slaves) > 0 {
+		for i := 0; i < slaveCount; i++ {
+			index := rand.Intn(len(kvs.slaves))
+			_, ok := indices[index]
+			if !ok {
+				indices[index] = true
+				selectedSlaves = append(selectedSlaves, kvs.slaves[index])
+			}
 		}
 	}
 
@@ -129,24 +156,28 @@ func (kvs *KeyValueStore) handleWrite(command []string) bool {
 	kvs.keyToSlaves[key] = selectedSlaves
 	kvs.keySlavesMux.Unlock()
 
-	acks := kvs.receiveAckFromSlaves(strings.Join(command, " "), 3*time.Second)
+	if len(selectedSlaves) > 0 {
+		acks := kvs.receiveAckFromSlaves(strings.Join(command, " "), 3*time.Second)
 
-	notReceivedSlaves := make([]*Slave, 0)
-	for slave, acked := range acks {
-		if !acked {
-			notReceivedSlaves = append(notReceivedSlaves, slave)
+		notReceivedSlaves := make([]*Slave, 0)
+		for slave, acked := range acks {
+			if !acked {
+				notReceivedSlaves = append(notReceivedSlaves, slave)
+			}
+		}
+
+		if len(notReceivedSlaves) > 0 {
+			fmt.Printf(Red+"No acknowledgment received from some slaves. Removing them.\n"+Reset)
+			for _, slave := range notReceivedSlaves {
+				kvs.removeSlave(slave)
+			}
 		}
 	}
 
-	if len(notReceivedSlaves) > 0 {
-		fmt.Printf(Red + "No acknowledgment received from some slaves. Removing them.\n" + Reset)
-		for _, slave := range notReceivedSlaves {
-			kvs.removeSlave(slave)
-		}
-		return true
-	}
+	// Log the successful write operation
+	kvs.logOperation("WRITE", key, value)
 
-	fmt.Printf(Magenta + "Write operation successful.\n" + Reset)
+	fmt.Printf(Magenta+"Write operation successful.\n"+Reset)
 	return true
 }
 
@@ -160,12 +191,18 @@ func (kvs *KeyValueStore) handleRead(command []string) string {
 	kvs.keySlavesMux.Unlock()
 
 	if !exists {
-		fmt.Printf(Red + "Key does not exist in Map somehow: %s\n\n", key + Reset)
+		fmt.Printf(Red+"Key does not exist in Map somehow: %s\n\n", key+Reset)
 		slaveResponses := kvs.sendRequestsToAllSlaves(strings.Join(command, " "), 3*time.Second)
 		for slave, response := range slaveResponses {
 			if response != key+" NOT FOUND" {
 				responses = append(responses, response)
 				associatedSlaves = append(associatedSlaves, slave)
+				
+				// Extract value from response for logging
+				parts := strings.Split(response, " ")
+				if len(parts) >= 2 {
+					kvs.logOperation("READ", key, parts[1])
+				}
 			}
 		}
 
@@ -186,6 +223,11 @@ func (kvs *KeyValueStore) handleRead(command []string) string {
 	for _, slave := range savedSlaves {
 		response, err := kvs.sendRequestToSlave(slave, strings.Join(command, " "), 3*time.Second)
 		if err == nil {
+			// Extract value from response for logging
+			parts := strings.Split(response, " ")
+			if len(parts) >= 2 {
+				kvs.logOperation("READ", key, parts[1])
+			}
 			return response
 		}
 	}
@@ -242,8 +284,7 @@ func handleClient(conn net.Conn, kvs *KeyValueStore) {
 		}
 
 		data := string(buffer[:n])
-		// color.Yellow("Received from Client: %s", data)
-		fmt.Printf(Yellow + "Received from Client: %s\n\n", data + Reset)
+		fmt.Printf(Yellow+"Received from Client: %s\n\n", data+Reset)
 
 		command := strings.Split(data, " ")
 		if len(command) < 2 {
@@ -270,11 +311,11 @@ func handleSlave(conn net.Conn) {
 		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		if err != nil {
-			fmt.Println(Red + "Read error: %v%s", err, Reset)
+			fmt.Printf(Red+"Read error: %v%s\n", err, Reset)
 			return
 		}
 		var data string = string(buf[:n])
-		fmt.Println(Green + "Received:\n", data + Reset)
+		fmt.Println(Green+"Received:\n", data+Reset)
 		if n == 0 {
 			break
 		}
@@ -285,17 +326,17 @@ func handleConnection(conn net.Conn, kvs *KeyValueStore) {
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		fmt.Println(Red + "Read error:%v%s", err, Reset)
+		fmt.Printf(Red+"Read error: %v%s\n", err, Reset)
 		return
 	}
 	var data string = string(buf[:n])
-	fmt.Println(Yellow + "Received:", data + Reset)
+	fmt.Println(Yellow+"Received:", data+Reset)
 
 	if data == "CLIENT" {
-		fmt.Println(Green + "Client Connected" + Reset)
+		fmt.Println(Green+"Client Connected"+Reset)
 		go handleClient(conn, kvs)
 	} else if data == "SLAVE" {
-		fmt.Println(Green + "Slave Connected" + Reset)
+		fmt.Println(Green+"Slave Connected"+Reset)
 		remoteAddr := conn.RemoteAddr()
 		var ip string
 		var port int
@@ -310,23 +351,18 @@ func handleConnection(conn net.Conn, kvs *KeyValueStore) {
 		default:
 			fmt.Println("Error")
 		}
-		fmt.Printf("connection of slave: %s %s", ip, port)
+		fmt.Printf("Connection of slave: %s %d\n", ip, port)
 		slave := Slave{conn: conn}
 		kvs.slaves = append(kvs.slaves, &slave)
 		go handleSlave(conn)
 	} else if data == "BACKUP" {
-		fmt.Println(Green + "Backup server connected" + Reset)
+		fmt.Println(Green+"Backup server connected"+Reset)
 	}
 }
 
 func main() {
 	fmt.Println("Distributed Key-Value Store Server")
 	var port string = "12345"
-	var port_int int = 12345
-	if checkPortInUse(port) {
-		port_int++
-	}
-	port = strconv.Itoa(port_int)
 	fmt.Printf("Master Server Started\n\n")
 
 	ln, err := net.Listen("tcp", ":"+port)
@@ -335,9 +371,21 @@ func main() {
 	}
 	defer ln.Close()
 
-	fmt.Printf("Server is listening on port %s...", port)
+	fmt.Printf("Server is listening on port %s...\n", port)
 
-	var kvs *KeyValueStore = NewKeyValueStore()
+	kvs := NewKeyValueStore()
+	defer kvs.closeResources()
+	
+	// Attempt to connect to backup server to notify it's online
+	go func() {
+		time.Sleep(1 * time.Second)
+		conn, err := net.DialTimeout("tcp", "localhost:12346", 2*time.Second)
+		if err == nil {
+			conn.Write([]byte("MASTER"))
+			conn.Close()
+		}
+	}()
+	
 	for {
 		conn, err := ln.Accept() // Accept a connection
 		if err != nil {
