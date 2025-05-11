@@ -1,9 +1,9 @@
-# Distributed Shared Memory - TEAM 6
+# Distributed Shared Memory 
 
 ## Team Members
-1. Manuj Garg - 2021101047 
-2. Pranav Gupta - 2021101095 
-3. Gowlapalli Rohit - 2021101113 
+1. Manuj Garg
+2. Pranav Gupta
+3. Gowlapalli Rohit
 
 # Overview
 ```
